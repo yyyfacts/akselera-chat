@@ -1,5 +1,5 @@
 'use client';
-import { useEffect, useRef, useState } from 'react';
+import { Fragment, useEffect, useRef, useState } from 'react';
 import { supabase } from '../lib/supabase';
 
 const ini = (n = '?') => n.split(' ').map((w) => w[0]).slice(0, 2).join('').toUpperCase();
@@ -15,6 +15,14 @@ const Logo = () => (
     <img className="lg-l" src="/logo-black.png" alt="Akselera.Tech" height="26" />
     <img className="lg-d" src="/logo-white.png" alt="Akselera.Tech" height="26" />
   </>
+);
+
+// Avatar inisial + titik hijau kalau pengguna sedang online
+const Avatar = ({ name, online }) => (
+  <div className="avw">
+    <div className="av">{ini(name)}</div>
+    {online && <span className="dot" title="Online" />}
+  </div>
 );
 
 function Theme() {
@@ -79,7 +87,7 @@ function Auth() {
   );
 }
 
-function Picker({ me, onPick, onClose }) {
+function Picker({ me, online, onPick, onClose }) {
   const [users, setUsers] = useState([]);
   const [q, setQ] = useState('');
   useEffect(() => {
@@ -96,7 +104,7 @@ function Picker({ me, onPick, onClose }) {
         <div className="scroll">
           {list.map((u) => (
             <div key={u.id} className="row" onClick={() => onPick(u)}>
-              <div className="av">{ini(u.name)}</div>
+              <Avatar name={u.name} online={online.has(u.id)} />
               <div className="grow"><b>{u.name}</b><div className="sub">{u.email}</div></div>
             </div>
           ))}
@@ -114,8 +122,12 @@ function Chat({ me }) {
   const [text, setText] = useState('');
   const [picker, setPicker] = useState(false);
   const [q, setQ] = useState('');
+  const [hits, setHits] = useState([]);          // hasil pencarian isi pesan
+  const [online, setOnline] = useState(() => new Set());
+  const [divider, setDivider] = useState(null);  // id pesan pertama yang belum dibaca
   const end = useRef(null);
   const curId = useRef(null);
+  const jump = useRef(null);                     // pesan yang harus di-scroll (dari hasil pencarian)
   curId.current = cur?.chat_id;
 
   const load = async () => {
@@ -123,26 +135,96 @@ function Chat({ me }) {
     setChats(data || []);
   };
 
+  // Tandai pesan lawan bicara di chat ini sebagai sudah dibaca, lalu segarkan badge
+  const markRead = async (cid) => {
+    await supabase.rpc('mark_read', { cid });
+    load();
+  };
+
+  // Realtime: pesan masuk
   useEffect(() => {
     load();
     const ch = supabase
       .channel('messages')
       .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages' }, (p) => {
+        const m = p.new;
+        if (m.conversation_id === curId.current) {
+          setMsgs((list) => (list.some((x) => x.id === m.id) ? list : [...list, m]));
+          // Chat sedang dibuka dan tab terlihat: langsung dianggap dibaca
+          if (m.sender_id !== me.id && document.visibilityState === 'visible') {
+            markRead(m.conversation_id);
+            return;
+          }
+        }
         load();
-        if (p.new.conversation_id === curId.current)
-          setMsgs((m) => (m.some((x) => x.id === p.new.id) ? m : [...m, p.new]));
       })
-      .subscribe();
+      .subscribe((status) => { if (status === 'SUBSCRIBED') load(); });
     return () => { supabase.removeChannel(ch); };
   }, []);
 
-  useEffect(() => { end.current?.scrollIntoView(); }, [msgs]);
+  // Status online lewat Realtime Presence: tiap pengguna yang membuka app mendaftarkan dirinya
+  useEffect(() => {
+    const ch = supabase.channel('online', { config: { presence: { key: me.id } } });
+    ch
+      .on('presence', { event: 'sync' }, () => setOnline(new Set(Object.keys(ch.presenceState()))))
+      .subscribe(async (status) => {
+        if (status === 'SUBSCRIBED') await ch.track({ at: new Date().toISOString() });
+      });
+    return () => { supabase.removeChannel(ch); };
+  }, [me.id]);
 
-  async function open(c) {
+  // Kembali ke tab ini: pesan yang masuk saat tab tersembunyi ditandai dibaca
+  useEffect(() => {
+    const onVis = () => {
+      if (document.visibilityState === 'visible' && curId.current) markRead(curId.current);
+    };
+    document.addEventListener('visibilitychange', onVis);
+    return () => document.removeEventListener('visibilitychange', onVis);
+  }, []);
+
+  // Total belum dibaca di judul tab
+  const totalUnread = chats.reduce((s, c) => s + (c.unread || 0), 0);
+  useEffect(() => {
+    document.title = (totalUnread ? `(${totalUnread}) ` : '') + 'Akselera.Tech Chat';
+  }, [totalUnread]);
+
+  // Scroll: ke pesan hasil pencarian, atau ke pesan terbaru
+  useEffect(() => {
+    if (!msgs.length) return;
+    const id = jump.current;
+    jump.current = null;
+    const el = id && document.getElementById('m-' + id);
+    if (el) {
+      el.scrollIntoView({ block: 'center' });
+      el.classList.add('hit');
+    } else {
+      end.current?.scrollIntoView();
+    }
+  }, [msgs]);
+
+  // Pencarian isi pesan (ditunda 300 ms agar tidak query tiap ketikan)
+  useEffect(() => {
+    const s = q.trim();
+    if (s.length < 2) { setHits([]); return; }
+    let stale = false;
+    const t = setTimeout(async () => {
+      const { data } = await supabase.rpc('search_messages', { q: s });
+      if (!stale) setHits(data || []);
+    }, 300);
+    return () => { stale = true; clearTimeout(t); };
+  }, [q]);
+
+  async function open(c, jumpTo = null) {
     setCur(c);
+    setDivider(null);
+    jump.current = jumpTo;
     const { data } = await supabase.from('messages').select('*')
-      .eq('conversation_id', c.chat_id).order('created_at').limit(500);
-    setMsgs(data || []);
+      .eq('conversation_id', c.chat_id).order('created_at', { ascending: false }).limit(500);
+    if (curId.current !== c.chat_id) return; // pengguna sudah pindah chat
+    const list = (data || []).reverse();
+    setDivider(list.find((m) => m.sender_id !== me.id && !m.read_at)?.id ?? null);
+    setMsgs(list);
+    markRead(c.chat_id);
   }
 
   async function pick(u) {
@@ -165,7 +247,9 @@ function Chat({ me }) {
     load();
   }
 
-  const shown = chats.filter((c) => c.other_name.toLowerCase().includes(q.toLowerCase()));
+  const s = q.trim().toLowerCase();
+  const shown = chats.filter((c) => !s || (c.other_name + ' ' + c.other_email).toLowerCase().includes(s));
+  const found = hits.map((h) => ({ h, c: chats.find((x) => x.chat_id === h.chat_id) })).filter((x) => x.c);
 
   return (
     <div className={'app' + (cur ? ' open' : '')}>
@@ -175,21 +259,44 @@ function Chat({ me }) {
           <button className="ghost" onClick={() => supabase.auth.signOut()}>Keluar</button>
         </div>
         <div className="top">
-          <input placeholder="Cari chat" value={q} onChange={(e) => setQ(e.target.value)} />
-          <button onClick={() => setPicker(true)}>+ Chat baru</button>
+          <input type="search" placeholder="Cari chat atau pesan" value={q} onChange={(e) => setQ(e.target.value)} />
+          <button onClick={() => setPicker(true)} aria-label="Chat baru">+<span className="plus-t"> Chat baru</span></button>
         </div>
         <div className="sub" style={{ padding: '8px 14px' }}>Masuk sebagai {me.user_metadata?.name || me.email}</div>
         <div className="scroll">
           {shown.map((c) => (
-            <div key={c.chat_id} className={'row' + (cur?.chat_id === c.chat_id ? ' on' : '')} onClick={() => open(c)}>
-              <div className="av">{ini(c.other_name)}</div>
+            <div key={c.chat_id}
+              className={'row' + (cur?.chat_id === c.chat_id ? ' on' : '') + (c.unread > 0 ? ' unread' : '')}
+              onClick={() => open(c)}>
+              <Avatar name={c.other_name} online={online.has(c.other_id)} />
               <div className="grow">
-                <div className="between"><b>{c.other_name}</b><span className="sub">{stamp(c.last_at)}</span></div>
-                <div className="sub">{c.last_body || 'Belum ada pesan'}</div>
+                <div className="between">
+                  <b className="nm">{c.other_name}</b>
+                  <span className="sub">{stamp(c.last_at)}</span>
+                </div>
+                <div className="between">
+                  <div className="sub grow">{c.last_body || 'Belum ada pesan'}</div>
+                  {c.unread > 0 && <span className="badge">{c.unread > 99 ? '99+' : c.unread}</span>}
+                </div>
               </div>
             </div>
           ))}
-          {!shown.length && <p className="empty" style={{ padding: 20 }}>Belum ada chat</p>}
+          {!shown.length && !found.length && (
+            <p className="empty" style={{ padding: 20 }}>{s ? 'Tidak ditemukan' : 'Belum ada chat'}</p>
+          )}
+          {found.length > 0 && <div className="sect">Pesan</div>}
+          {found.map(({ h, c }) => (
+            <div key={h.message_id} className="row" onClick={() => open(c, h.message_id)}>
+              <Avatar name={c.other_name} online={online.has(c.other_id)} />
+              <div className="grow">
+                <div className="between">
+                  <b className="nm">{c.other_name}</b>
+                  <span className="sub">{stamp(h.created_at)}</span>
+                </div>
+                <div className="sub">{h.body}</div>
+              </div>
+            </div>
+          ))}
         </div>
       </aside>
 
@@ -197,21 +304,28 @@ function Chat({ me }) {
         {cur ? (
           <>
             <div className="head">
-              <button className="ghost back" onClick={() => setCur(null)}>←</button>
-              <div className="av">{ini(cur.other_name)}</div>
-              <div className="grow"><b>{cur.other_name}</b><div className="sub">{cur.other_email}</div></div>
+              <button className="ghost back" onClick={() => setCur(null)} aria-label="Kembali">←</button>
+              <Avatar name={cur.other_name} online={online.has(cur.other_id)} />
+              <div className="grow">
+                <b>{cur.other_name}</b>
+                <div className="sub">{online.has(cur.other_id) ? 'Online' : 'Offline'}</div>
+              </div>
             </div>
             <div className="msgs">
               {msgs.map((m) => (
-                <div key={m.id} className={'b' + (m.sender_id === me.id ? ' me' : '')}>
-                  {m.body}<small>{hm(m.created_at)}</small>
-                </div>
+                <Fragment key={m.id}>
+                  {m.id === divider && <div className="divider">Pesan belum dibaca</div>}
+                  <div id={'m-' + m.id} className={'b' + (m.sender_id === me.id ? ' me' : '')}>
+                    {m.body}<small>{hm(m.created_at)}</small>
+                  </div>
+                </Fragment>
               ))}
               <div ref={end} />
             </div>
             <form className="send" onSubmit={send}>
-              <input placeholder="Tulis pesan" value={text} onChange={(e) => setText(e.target.value)} maxLength={2000} />
-              <button>Kirim</button>
+              <input placeholder="Tulis pesan" value={text} onChange={(e) => setText(e.target.value)} maxLength={2000} enterKeyHint="send" />
+              {/* preventDefault agar keyboard ponsel tidak menutup tiap kali menekan Kirim */}
+              <button onMouseDown={(e) => e.preventDefault()}>Kirim</button>
             </form>
           </>
         ) : (
@@ -219,7 +333,7 @@ function Chat({ me }) {
         )}
       </section>
 
-      {picker && <Picker me={me} onPick={pick} onClose={() => setPicker(false)} />}
+      {picker && <Picker me={me} online={online} onPick={pick} onClose={() => setPicker(false)} />}
     </div>
   );
 }
